@@ -1,0 +1,546 @@
+/* -------------------------------------------------------------------------- *
+ * P4_HsHaEchoServer
+ * 
+ * This file contains an implementation of an echo server - a program 
+ * that accepts connections and echoes back whatever you write to it.
+ * The implementation uses a Half-Sync/Half-Async design pattern, with the 
+ * following roles :
+ *  - EchoAsyncTask is the base implementation of the async task, it uses a 
+ *      global queue for enqueing messages received from clients;
+ *  - EchoSyncTask is the base implementation of the sync task, it dequeues
+ *      messages from the global queue and processes them;
+ *  - EchoMsg - objects passed using the queue;
+ *  - HalfSyncPool - manages a pool of worker threads;
+ *  - EchoWorker - worker thread, extends EchoSyncTask; it reads messages 
+ *      from the global queue and echoes back to the client its id and 
+ *      received message;
+ *  - EchoServiceHandler - extends EchoAsyncTask; reads messages from socket 
+ *      and queues them to the global queue;
+ * 
+ * The implementation also uses a Reactor design pattern, with the following 
+ * roles :
+ *  - EchoReactor : initiation dispatcher, uses a selector to listen
+ *      to multiple channels (handles) and forward events to the appropiate 
+ *      event handlers; 
+ *  - ServiceHandler : generic specification of an event handler;
+ *  - EchoAcceptor : implementation of ServiceHandler, handles connection 
+ *      requests from clients
+ *  - EchoServiceHandler : implementation of ServiceHandler, extension of 
+ *      EchoAsyncTask (see above)
+ * 
+ * Also, we use a Wrapper Facade over the socket facilities offered by java : 
+ *  - ListeningSocket - used for listening and accepting connections
+ *  - DataSocket - used for reading/writing data
+ * NOTE : I used this code section (with minor modifications) from a peer whose 
+ *   assigment I evaluated on the previous assigment (#3).
+ * 
+ * The solution also uses some helper classes : 
+ *  - Event : for event definition and related constants
+ *  - EventProcStatus : return type for event processing function
+ *  - Log : debugging purposes
+ * 
+ * Author : Barbarossa
+ * -------------------------------------------------------------------------- */
+package p4_hshaechoserver;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.channels.SelectableChannel;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.nio.channels.spi.SelectorProvider;
+import java.nio.charset.Charset;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+
+/**
+ *  Main class - HALF-SYNC/HALF-ASYNC ECHO SERVER
+ */
+public class P4_HsHaEchoServer {
+    
+    public static final int ECHO_SERVER_PORT = 29999;
+    public static final int SYNC_POOL_SIZE = 5;
+    public static final int QUEUE_SIZE = 256;
+    
+    /* Queue for HS-HA communication */
+    private static final BlockingQueue<EchoMsg> HAHS_QUEUE = 
+            new ArrayBlockingQueue<>(QUEUE_SIZE);
+
+    public static void main(String[] args) {
+        
+        /* Initiate half-sync part, get the threads waiting */
+        HalfSyncPool hsp = new HalfSyncPool(SYNC_POOL_SIZE);
+        hsp.activate();
+
+        /* Register the Acceptor with the Reactor and get the Reactor running */
+        EchoAcceptor ac = new EchoAcceptor(ECHO_SERVER_PORT);
+        EchoReactor.getInstance().registerHandler(ac, Event.EV_ACCEPT);
+        EchoReactor.getInstance().reactorLoop();
+    }
+    
+    public static BlockingQueue<EchoMsg> getQueue() {
+        return HAHS_QUEUE;
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Half-Sync / Half-Async pattern classes */
+
+/**
+ * Async task - enqueue messages to the global queue 
+ */
+class EchoAsyncTask {
+    public final void enqueue(EchoMsg e) {
+        try {
+            P4_HsHaEchoServer.getQueue().put(e);
+        } catch (InterruptedException ex) {
+            Log.println(ex.getStackTrace().toString());
+        }
+    }
+}
+
+/**
+ * Sync task - read messages from global queue for further processing 
+ */
+class EchoSyncTask {
+    public final EchoMsg syncRead() {
+        try {
+            return P4_HsHaEchoServer.getQueue().take();
+        } catch (InterruptedException ex) {
+            Log.println(ex.getStackTrace().toString());
+            return null;
+        }
+    }
+}
+
+/**
+ * Msg to be passed between HA and HS 
+ */
+class EchoMsg {
+    /* message from user */
+    public String msg;
+    /* socket */
+    public DataSocket socket;    
+    
+    public EchoMsg(String msg, DataSocket socket) {
+        this.msg = msg;
+        this.socket = socket;
+    }
+}
+
+
+/** 
+ * Sync task pool - worker manager
+ */
+class HalfSyncPool {
+    ExecutorService executor;
+    int size;
+    
+    public HalfSyncPool(int size) {
+        this.size = size;
+        executor = Executors.newFixedThreadPool(size);
+    }
+    
+    public void activate() {
+        /* Get the threads running and waiting for events*/
+        for(int i = 0 ; i < size ; i++) {
+            Runnable worker = new EchoWorker();
+            executor.execute(worker);
+        }
+    }
+    
+    public void shutdown() {
+        executor.shutdownNow();
+    }
+}
+
+
+/** 
+ * Worker - reads messages from queue, echoes back to the client useful info
+ */
+class EchoWorker extends EchoSyncTask 
+                 implements Runnable {
+
+    @Override
+    public void run() {
+        Log.println("EchoSyncTask "
+                + String.valueOf(Thread.currentThread().getId())
+                + " started execution ");
+
+        while (true) {
+            /* Wait for message on the queue */
+            EchoMsg eMsg = syncRead();
+
+            /* Process msg */
+            eMsg.socket.write(String.valueOf(Thread.currentThread().getId())
+                    + " : " + eMsg.msg);
+        }
+    }
+    
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Reactor pattern classes */
+
+/** 
+ *  The Reactor (initiation dispatcher) :
+ *      - listens to multiple channels using a selector (demux function)
+ *      - manages event handlers (register, unregister)
+ *      - at event occurrence, forwards the event to the appropriate handler
+ */
+class EchoReactor {
+
+    private Selector selector;
+    private static EchoReactor instance = null;
+    private HashMap <SelectionKey, ServiceHandler> handlers;
+    
+    private EchoReactor() {
+        try {
+            selector = SelectorProvider.provider().openSelector();
+        } catch (IOException ex) {
+            Log.println(ex.getStackTrace().toString());
+        }
+        handlers = new HashMap <> ();
+
+        Log.println("EchoInitDispatch created...");
+    }
+
+    public static EchoReactor getInstance() {
+        if (instance == null) {
+            instance = new EchoReactor();
+        }
+        return instance;
+    }
+
+    
+    public void reactorLoop() {
+        while (true) {
+            try {
+                handleEvents();
+            } catch (IOException ex) {
+                Log.println(ex.getStackTrace().toString());
+            }
+        }
+    }
+    
+    public void handleEvents() throws IOException {
+        Log.println("------------------------------------------------------------");
+        Log.println("EchoInitDispatch is waiting for events on selector...");
+        selector.select();
+
+        Log.println("    Events received...");
+        Set readyKeys = selector.selectedKeys();
+        Iterator iterator = readyKeys.iterator();
+
+        while (iterator.hasNext()) {
+            SelectionKey key = (SelectionKey) iterator.next();
+            iterator.remove();
+
+            if (!key.isValid()) {
+                continue;
+            }
+            if (key.isAcceptable()) {
+                Log.println("    ACCEPT event on key " + key);
+                callHandler(key, Event.EV_ACCEPT);
+            } else if (key.isReadable()) {
+                Log.println("    READ event on key " + key);
+                callHandler(key, Event.EV_READ);
+            }
+        }
+    }
+    
+
+    public void callHandler(SelectionKey key, int ev) {
+            boolean unregister = false;
+            ServiceHandler h = handlers.get(key);
+            
+            try {
+                EventProcStatus evStatus = h.handleInput(ev);
+                switch(evStatus) {
+                    case EV_PROC_CLIENT_DISCONNECTED :
+                        unregister = true;
+                        break;
+                }
+            } catch (Exception ex) {
+                Log.println("    Exception processing event " + ev
+                        + " from key " + key + " : " + ex.getStackTrace());
+                unregister = true;
+            }
+
+            if(unregister) {
+                removeHandler(key);
+            }
+    }
+
+    public SelectionKey registerHandler(ServiceHandler h, int eventMask) {
+        int op = 0;
+        SelectionKey key = null;
+
+        if ((eventMask & Event.EV_ACCEPT) != 0) {
+            op |= SelectionKey.OP_ACCEPT;
+            Log.println("    EventHandler attached for OP_ACCEPT operation...");
+        }
+        if ((eventMask & Event.EV_READ) != 0) {
+            op |= SelectionKey.OP_READ;
+            Log.println("    EventHandler attached for OP_READ operation...");
+        }
+        
+        try {
+            h.getHandle().configureBlocking(false);
+            key = h.getHandle().register(selector, op);
+            handlers.put(key, h);
+        } catch (IOException ex) {
+            Log.println(ex.getStackTrace().toString());
+        }
+        
+        return key;
+    }
+
+    public void removeHandler(SelectionKey key) {
+        key.cancel();
+        handlers.remove(key);
+    }
+    
+}
+
+
+/** 
+ *  ServiceHandler generic specification
+ */
+interface ServiceHandler {
+
+    public EventProcStatus handleInput(int evType) throws Exception;
+
+    public SelectableChannel getHandle();
+}
+
+
+/** 
+ *  The acceptor : 
+ *      - accepts & establishes connections from the clients
+ *      - registers message listeners with the initiation dispatcher
+ */
+class EchoAcceptor implements ServiceHandler {
+
+    private ListeningSocket socket;
+
+    public EchoAcceptor(int port) {
+        try {
+            this.socket = new ListeningSocket(port);
+        } catch (IOException ex) {
+            Log.println(ex.getStackTrace().toString());
+        }
+
+        Log.println("        EchoAcceptor created...");
+    }
+
+    @Override
+    public EventProcStatus handleInput(int evType) {
+        Log.println("        EchoAcceptor reading event...");
+
+        if (evType != Event.EV_ACCEPT) {
+            Log.println("        EchoAcceptor did not find EV_ACCEPT...");
+            return EventProcStatus.EV_PROC_WRONG_EV;
+        }
+        
+        DataSocket cs = socket.accept();
+        if (cs != null) {
+            EchoReactor.getInstance().registerHandler(
+                    new EchoServiceHandler(cs),
+                    Event.EV_READ);
+        }
+
+        Log.println("        EchoAcceptor processed EV_ACCEPT succesfully.");
+        return EventProcStatus.EV_PROC_OK;
+    }
+
+    @Override
+    public SelectableChannel getHandle() {
+        return (SelectableChannel)socket.getHandle();
+    }
+}
+
+
+/** 
+ *  The message handler : 
+ *      - forwards the message back to the client
+ */
+class EchoServiceHandler extends EchoAsyncTask 
+                         implements ServiceHandler {
+
+    private DataSocket socket;
+    
+    private static int idGen = 1;
+    private int id;
+
+    public EchoServiceHandler(DataSocket socket) {
+        this.socket = socket;
+        this.id = idGen++;
+        Log.println("        EchoServiceHandler created...");
+    }
+
+    @Override
+    public EventProcStatus handleInput(int evType) throws IOException {
+
+        String data = this.socket.read();
+        if (data == null) {
+            Log.println("        EchoServiceHandler : client disconnected " + 
+                    this.socket.getPeerDescription());
+            socket.close();
+            return EventProcStatus.EV_PROC_CLIENT_DISCONNECTED;
+        }
+        
+        
+        Log.println("        EchoServiceHandler : "
+                + this.socket.getPeerDescription() + " wrote: " + data);
+        
+        /* Put the message into the hahs queue */
+        enqueue(new EchoMsg(data, socket));
+
+        Log.println("        EchoServiceHandler " + id + 
+                " succesfully processed message");
+        return EventProcStatus.EV_PROC_OK;
+    }
+
+    @Override
+    public SelectableChannel getHandle() {
+        return (SelectableChannel)socket.getHandle();
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Wrapper facade  */
+/**
+ * Socket for listening to incoming connection requests
+ */
+class ListeningSocket {
+
+    private ServerSocketChannel socket;
+
+    public ListeningSocket(int port) throws IOException {
+        this.socket = ServerSocketChannel.open();
+        this.socket.configureBlocking(false);
+        this.socket.socket().bind(new InetSocketAddress(port));
+    }
+
+    public DataSocket accept() {
+        try {
+            SocketChannel s = this.socket.accept();
+            if (s == null) {
+                Log.println("Failed to accept");
+                return null;
+            }
+            s.configureBlocking(false);
+            return new DataSocket(s);
+        } catch (IOException e) {
+            Log.println("Failed to accept");
+            Log.println(e.getStackTrace().toString());
+        }
+        return null;
+    }
+
+    public SelectableChannel getHandle() {
+        return socket;
+    }
+}
+
+/**
+ * Socket for reading/writing data
+ */
+class DataSocket {
+
+    private SocketChannel socket;
+
+    public DataSocket(SocketChannel s) {
+        this.socket = s;
+    }
+
+    public SelectableChannel getHandle() {
+        return socket;
+    }
+
+    public synchronized String read() {
+        Charset charset = Charset.forName("ascii");
+        ByteBuffer buffer = ByteBuffer.allocate(1024);
+        try {
+            int nread = this.socket.read(buffer);
+            if (nread == -1) {
+                return null;
+            }
+            buffer.flip();
+            CharBuffer buf = charset.decode(buffer);
+            return buf.toString();
+        } catch (IOException e) {
+            Log.println("Failed to read : " + e.getStackTrace());
+            return null;
+        }
+    }
+
+    public String getPeerDescription() {
+        SocketAddress addr = this.socket.socket().getRemoteSocketAddress();
+        if (addr != null) {
+            return addr.toString();
+        }
+        return null;
+    }
+
+    public synchronized void write(String data) {
+        Charset charset = Charset.forName("ascii");
+        CharBuffer buf = CharBuffer.wrap(data);
+        ByteBuffer b = charset.encode(buf);
+        try {
+            this.socket.write(b);
+        } catch (IOException e) {
+            Log.println("Write failed : " + e.getStackTrace());
+        }
+    }
+
+    public void close() {
+        try {
+            this.socket.close();
+        } catch (IOException e) {
+            Log.println("Warning: Failed to close data socket : "
+                    + e.getStackTrace());
+        }
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Helper classes */
+
+/* Event types and related constants */
+class Event {
+    public static final int EV_ACCEPT = (1 << 0);
+    public static final int EV_READ   = (1 << 1);
+    
+    public static final int MAX_EVENTS = 2;
+}
+
+/* Return type for event processing function */
+enum EventProcStatus {
+    EV_PROC_OK,
+    EV_PROC_WRONG_EV,
+    EV_PROC_CLIENT_DISCONNECTED
+}
+
+/* For debugging purposes */
+class Log {
+    public static void println(String text) {
+        System.out.println(text);
+    }
+}
